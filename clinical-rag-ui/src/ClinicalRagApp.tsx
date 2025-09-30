@@ -16,6 +16,7 @@ import { Badge } from "@/components/ui/badge";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Sheet, SheetContent, SheetFooter, SheetHeader, SheetTitle, SheetTrigger } from "@/components/ui/sheet";
+import { ENDPOINT, API_KEY, API_VERSION, DEPLOYMENT_NAME } from "@/api_keys";
 
 /**
  * Clinical RAG UI Framework
@@ -69,23 +70,54 @@ export type RagAnswer = {
   warnings?: string[];
 };
 
-// Configuration for LLM endpoint
+// Configuration for Azure OpenAI GPT-5 endpoint
 const LLM_CONFIG = {
-  baseUrl: "http://localhost:9999/v1",
-  token: "dacbebe8c973154018a3d0f5",
-  timeout: 120000, // 120 seconds
+  azureEndpoint: ENDPOINT, // Replace with your AZURE_ENDPOINT_5
+  apiKey: API_KEY, // Replace with your OPENAI_KEY_5
+  apiVersion: API_VERSION, // Replace with your OPENAI_VERSION_5
+  deploymentName: DEPLOYMENT_NAME, // Replace with your GPT-5 deployment name
+  timeout: 120000,
 };
 
-// Replace the fake API layer with real LLM endpoint
+// Update the API configuration
+const API_BASE_URL = 'http://localhost:5200/api';
+
+// Replace the fake API layer with real database calls
 const api = {
   async listPatients(q: string): Promise<Patient[]> {
-    await delay(200);
-    const all = [
-      { id: "p001", name: "Jane Doe", dob: "1970-03-12" },
-      { id: "p002", name: "John Smith", dob: "1962-11-05" },
-      { id: "p003", name: "Samir Patel", dob: "1988-07-22" },
-    ];
-    return all.filter(p => p.name.toLowerCase().includes(q.toLowerCase())).slice(0, 10);
+    console.log('🔍 Searching for patients with query:', q);
+    
+    try {
+      const response = await fetch(`${API_BASE_URL}/patients/search`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ query: q })
+      });
+      
+      console.log('📡 API response status:', response.status);
+      
+      if (!response.ok) {
+        console.warn('⚠️ API server error');
+        return []; // Return empty array instead of fallback
+      }
+      
+      const results = await response.json();
+      console.log('✅ API results:', results);
+      
+      const patients = results.map((row: any) => ({
+        id: row.id,
+        name: row.name,
+        dob: row.dob
+      }));
+      
+      console.log('👥 Mapped patients:', patients);
+      return patients;
+    } catch (error) {
+      console.error('❌ Error searching patients:', error);
+      return []; // Return empty array instead of fallback
+    }
   },
   
   async runRag(params: {
@@ -96,69 +128,143 @@ const api = {
   }): Promise<{ hits: DocHit[]; answer: RagAnswer; meta: RunMetadata }> {
     const t0 = performance.now();
     
-    // For now, return empty hits since retrieval is not implemented
-    const hits: DocHit[] = [];
-    const retrievalMs = performance.now() - t0;
+    console.log('🔍 RAG Search starting with params:', {
+      question: params.question,
+      patientId: params.patientId,
+      k: params.settings.k,
+      docTypes: params.settings.docTypes
+    });
     
-    // Generate answer using the LLM endpoint
+    // Search database for relevant documents
+    let hits: DocHit[] = [];
+    try {
+      const searchPayload = {
+        query: params.question,
+        patient_id: params.patientId,
+        k: params.settings.k,
+        doc_types: params.settings.docTypes.length > 0 ? params.settings.docTypes : null
+      };
+      
+      console.log('📡 Sending document search request:', searchPayload);
+      
+      const response = await fetch(`${API_BASE_URL}/documents/search`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(searchPayload)
+      });
+      
+      console.log('📡 Document search response status:', response.status);
+      
+      if (response.ok) {
+        const searchResults = await response.json();
+        console.log('✅ Document search results:', searchResults);
+        console.log('📊 Found', searchResults.length, 'documents');
+        
+        // Convert to DocHit format
+        hits = searchResults.map((row: any) => ({
+          id: row.id,
+          patientId: row.patient_id,
+          encounterId: row.encounter_id,
+          docType: row.doc_type,
+          section: row.section,
+          date: row.date,
+          score: row.score,
+          snippet: row.snippet,
+          url: `#/document/${row.id}`,
+          pinned: false
+        }));
+        
+        console.log('🎯 Mapped document hits:', hits);
+      } else {
+        console.error('❌ Document search failed with status:', response.status);
+        const errorText = await response.text();
+        console.error('❌ Error response:', errorText);
+      }
+    } catch (error) {
+      console.error('❌ Error searching documents:', error);
+    }
+    
+    const retrievalMs = performance.now() - t0;
+    console.log('⏱️ Document retrieval took:', retrievalMs, 'ms');
+    
+    // Generate answer using Azure OpenAI GPT-5 endpoint with retrieved context
     const generationStart = performance.now();
     let answer: RagAnswer;
     
     try {
-      const response = await fetch(`${LLM_CONFIG.baseUrl}/chat/completions`, {
+      const url = `${LLM_CONFIG.azureEndpoint}/openai/deployments/${LLM_CONFIG.deploymentName}/chat/completions?api-version=${LLM_CONFIG.apiVersion}`;
+      
+      // Build context from retrieved documents
+      const context = hits.map(hit => 
+        `[${hit.docType}${hit.section ? ` - ${hit.section}` : ''} | ${hit.date.substring(0, 10)} | Score: ${hit.score?.toFixed(2)}]\n${hit.snippet}`
+      ).join('\n\n---\n\n');
+      
+      console.log('📝 Built context for LLM:', context.length, 'characters');
+      console.log('📄 Context preview:', context.substring(0, 200) + '...');
+      
+      const systemPrompt = context.length > 0 
+        ? `You are a clinical AI assistant. Answer questions based ONLY on the provided medical records context. If the context doesn't contain sufficient information to answer the question, state that clearly. Cite specific documents when possible by mentioning the document type and date.
+
+MEDICAL RECORDS CONTEXT:
+${context}`
+        : "You are a clinical AI assistant. No specific patient context is available. Provide a general medical response and clearly state the lack of patient-specific information.";
+
+      console.log('🤖 Using system prompt with context length:', systemPrompt.length);
+
+      const response = await fetch(url, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'Authorization': `Bearer ${LLM_CONFIG.token}`,
+          'api-key': LLM_CONFIG.apiKey,
         },
         body: JSON.stringify({
-          model: "tgi", // or whatever model identifier your TGI setup uses
           messages: [
             {
               role: "system",
-              content: "You are a clinical AI assistant. Answer questions based on medical knowledge. If you don't have enough information to provide a reliable answer, clearly state that the context is insufficient."
+              content: systemPrompt
             },
             {
               role: "user",
               content: params.question
             }
           ],
-          max_tokens: 500,
-          temperature: 0.1,
-          stream: false
+          reasoning_effort: "minimal",
         }),
         signal: AbortSignal.timeout(LLM_CONFIG.timeout)
       });
 
       if (!response.ok) {
-        throw new Error(`LLM API error: ${response.status} ${response.statusText}`);
+        const errorText = await response.text();
+        throw new Error(`Azure OpenAI API error: ${response.status} ${response.statusText} - ${errorText}`);
       }
 
       const data = await response.json();
       const generatedText = data.choices?.[0]?.message?.content || "No response generated.";
       
       answer = {
-        status: "ok",
+        status: hits.length > 0 ? "ok" : "insufficient",
         text: generatedText,
-        citedDocIds: [], // No citations since no retrieval yet
-        warnings: hits.length === 0 ? ["Answer generated without document retrieval"] : undefined
+        citedDocIds: hits.map(h => h.id), // Assume all retrieved docs are potentially cited
+        warnings: hits.length === 0 ? ["No relevant documents found in patient records"] : undefined
       };
       
     } catch (error: any) {
-      console.error('LLM generation error:', error);
+      console.error('Azure OpenAI generation error:', error);
       answer = {
         status: "error",
         text: `Error generating response: ${error.message}`,
         citedDocIds: [],
-        warnings: ["Failed to connect to LLM endpoint"]
+        warnings: ["Failed to connect to Azure OpenAI endpoint"]
       };
     }
     
     const generationMs = performance.now() - generationStart;
     const meta: RunMetadata = {
-      modelId: "tgi-local-llm",
-      promptTemplateHash: "clinical-v1",
-      indexSnapshotId: params.settings.indexVersion ?? "no-retrieval",
+      modelId: "azure-gpt-5",
+      promptTemplateHash: "clinical-v1-sqlite",
+      indexSnapshotId: `sqlite-fts-${params.settings.k}`,
       latencyMs: { 
         retrieval: Math.round(retrievalMs), 
         generation: Math.round(generationMs), 
@@ -224,13 +330,31 @@ export default function ClinicalRagApp() {
   // Search patients
   useEffect(() => {
     let active = true;
-    api.listPatients(patientQuery).then(list => {
-      if (active) setPatients(list);
+    console.log('🔄 Patient search effect triggered, query:', patientQuery);
+    
+    // If query is empty, show all patients initially
+    const searchQuery = patientQuery.trim() || '';
+    
+    api.listPatients(searchQuery).then(list => {
+      if (active) {
+        console.log('📋 Setting patients state:', list);
+        setPatients(list);
+      }
     });
+    
     return () => {
       active = false;
     };
   }, [patientQuery]);
+
+  // Load all patients on initial mount
+  useEffect(() => {
+    console.log('🚀 Component mounted, loading all patients');
+    api.listPatients('').then(list => {
+      console.log('🏥 Initial patients loaded:', list);
+      setPatients(list);
+    });
+  }, []); // Empty dependency array = run once on mount
 
   const pinnedIds = useMemo(() => hits.filter(h => h.pinned).map(h => h.id), [hits]);
 
@@ -338,8 +462,54 @@ export default function ClinicalRagApp() {
                     <div className="relative">
                       <Input id="patient" placeholder="Search patient by name" value={patientQuery} onChange={e => setPatientQuery(e.target.value)} />
                       <div className="absolute left-2 top-2.5 text-gray-400"><User className="w-4 h-4" /></div>
+                      <div className="absolute right-2 top-2.5">
+                        <Button 
+                          size="sm" 
+                          variant="ghost" 
+                          onClick={async () => {
+                            try {
+                              console.log('Manual API test starting...');
+                              const response = await fetch(`${API_BASE_URL}/patients/search`, {
+                                method: 'POST',
+                                headers: {
+                                  'Content-Type': 'application/json',
+                                },
+                                body: JSON.stringify({ query: 'jane' })
+                              });
+                              console.log('Response status:', response.status);
+                              const data = await response.json();
+                              console.log('Response data:', data);
+                              setPatients(data.map((row: any) => ({
+                                id: row.id,
+                                name: row.name,
+                                dob: row.dob
+                              })));
+                            } catch (error) {
+                              console.error('Manual test error:', error);
+                            }
+                          }}
+                          className="h-6 px-2 text-xs"
+                        >
+                          Test
+                        </Button>
+                      </div>
                     </div>
                     <div className="mt-2 max-h-40 border rounded-md bg-white overflow-auto">
+                      {/* DEBUG PANEL - Shows current state */}
+                      <div className="p-2 bg-blue-50 border-b text-xs">
+                        <strong>Debug:</strong> {patients.length} patients loaded | Query: "{patientQuery}"
+                        <br />
+                        API URL: {API_BASE_URL}/patients/search
+                        <br />
+                        Last search: {patientQuery ? 'searching...' : 'no search yet'}
+                      </div>
+                      
+                      {patients.length === 0 && (
+                        <div className="p-3 text-sm text-gray-500">
+                          No patients found. Try typing a name like "jane", "john", or "samir"
+                        </div>
+                      )}
+                      
                       {patients.map(p => (
                         <button
                           key={p.id}
@@ -534,7 +704,7 @@ export default function ClinicalRagApp() {
                               </div>
                               <div className="mt-1 text-sm text-gray-800 line-clamp-3">{h.snippet}</div>
                               <div className="mt-2 flex items-center gap-2">
-                                <Button size="xs" variant="ghost" className="h-7 px-2" onClick={() => togglePin(h.id)}>
+                                <Button size="sm" variant="ghost" className="h-7 px-2" onClick={() => togglePin(h.id)}>
                                   <span className={h.pinned ? "font-semibold" : ""}>{h.pinned ? "Unpin" : "Pin"}</span>
                                 </Button>
                                 {h.url && (
