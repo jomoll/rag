@@ -119,10 +119,16 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 def connect(db_path: str) -> sqlite3.Connection:
-    conn = sqlite3.connect(db_path)
+    # Use separate DB for QA tables to avoid conflicts
+    qa_db_path = db_path.replace('.sqlite', '_qa.sqlite')
+    conn = sqlite3.connect(qa_db_path, timeout=30.0)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA foreign_keys=ON;")
+    conn.execute("PRAGMA busy_timeout=30000;")
+    
+    # Attach main database for reading report_sections
+    conn.execute(f"ATTACH DATABASE '{db_path}' AS main_db")
     return conn
 
 def ensure_schema_fresh(conn: sqlite3.Connection) -> None:
@@ -179,13 +185,10 @@ class Chunk:
 
 def get_candidate_chunks(conn: sqlite3.Connection, limit: int, min_len: int = 60, max_len: int = 3000,
                          balance_by_section: bool = True) -> List[Chunk]:
-    """
-    Pull candidate chunks that do not already have QA, with optional balancing by section name.
-    """
-    # all section names present
+    """Read from attached main database"""
     rows = conn.execute("""
         SELECT UPPER(name) AS section_name, COUNT(*) AS n
-        FROM report_sections
+        FROM main_db.report_sections
         WHERE LENGTH(text) BETWEEN ? AND ?
     """, (min_len, max_len)).fetchall()
 
@@ -620,7 +623,7 @@ def insert_qa(conn: sqlite3.Connection, chunk: Chunk, model_name: str,
 # ---------------------------
 async def main_async(args):
     conn = connect(args.db)
-    ensure_schema_fresh(conn)
+    #ensure_schema_fresh(conn)
 
     chunks = get_candidate_chunks(conn, limit=args.limit, min_len=args.min_len, max_len=args.max_len,
                                   balance_by_section=not args.no_balance)
@@ -693,7 +696,7 @@ def parse_args():
     p.add_argument("--limit", type=int, default=5000, help="Max chunks to process")
     p.add_argument("--max-per-chunk", type=int, default=3, help="Ask model for up to this many per chunk")
     p.add_argument("--max-keep-per-chunk", type=int, default=3, help="Keep at most this many validated items per chunk")
-    p.add_argument("--min-len", type=int, default=40, help="Min chunk length in characters")
+    p.add_argument("--min-len", type=int, default=10, help="Min chunk length in characters")
     p.add_argument("--max-len", type=int, default=3000, help="Max chunk length in characters")
     p.add_argument("--no-balance", action="store_true", help="Do not balance by section")
 
